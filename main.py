@@ -6,6 +6,7 @@ import email
 from email.header import decode_header
 from email.message import Message
 from datetime import datetime, timedelta
+from typing import Optional
 import requests
 from dotenv import load_dotenv
 from google import genai
@@ -19,9 +20,28 @@ load_dotenv()
 
 EMAIL_USER = os.getenv("EMAIL_USER", "")
 EMAIL_PASS = os.getenv("EMAIL_APP_PASSWORD") or os.getenv("EMAIL_PASS", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS = [
+    m.strip()
+    for m in os.getenv(
+        "GROQ_MODELS",
+        "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b",
+    ).split(",")
+    if m.strip()
+]
+GEMINI_MODELS = [
+    m.strip()
+    for m in os.getenv(
+        "GEMINI_MODELS",
+        "gemini-3.5-flash-lite,gemini-3.5-flash",
+    ).split(",")
+    if m.strip()
+]
 
 REQUEST_DELAY_SECONDS = 3
 MAX_BODY_CHARS = 800
@@ -31,6 +51,17 @@ HISTORY_FILE = "processed.txt"
 # ==============================================================================
 # 2. FILTROS HEURÍSTICOS LOCAIS (CUSTO ZERO DE IA)
 # ==============================================================================
+NOISE_SENDERS = [
+    "noreply@github.com",
+    "notifications@github.com",
+]
+
+NOISE_SUBJECT_TERMS = [
+    "[ikedaworks/job-sentinel]",
+    "run failed:",
+    "workflow run",
+]
+
 BLOCKED_KEYWORDS = [
     "pedido confirmado", "seu pedido", "saiu para entrega", "nota fiscal",
     "fatura", "pix", "boleto", "extrato", "cupom", "combinho", "black friday"
@@ -81,13 +112,17 @@ def validate_environment() -> None:
     required_vars = {
         "EMAIL_USER": EMAIL_USER,
         "EMAIL_APP_PASSWORD": EMAIL_PASS,
-        "GEMINI_API_KEY": GEMINI_API_KEY,
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
     }
     missing = [key for key, value in required_vars.items() if not value]
     if missing:
         raise EnvironmentError(f"Variáveis de ambiente ausentes: {', '.join(missing)}")
+
+    if not GROQ_API_KEY and not GEMINI_API_KEY:
+        raise EnvironmentError(
+            "Configure ao menos uma chave de IA: GROQ_API_KEY ou GEMINI_API_KEY."
+        )
 
 
 def load_processed_hashes() -> set[str]:
@@ -150,8 +185,17 @@ def extract_compact_body(message: Message) -> str:
 
 
 def is_job_candidate(sender: str, subject: str, body_snippet: str) -> bool:
-    """Filtro heurístico local (0 tokens) priorizando termos de carreira."""
-    searchable_text = f"{sender} {subject} {body_snippet[:300]}".lower()
+    """Filtro heurístico local (0 tokens) bloqueando ruído e priorizando carreira."""
+    sender_lower = sender.lower()
+    subject_lower = subject.lower()
+
+    if any(noise in sender_lower for noise in NOISE_SENDERS):
+        return False
+
+    if any(term in subject_lower for term in NOISE_SUBJECT_TERMS):
+        return False
+
+    searchable_text = f"{sender_lower} {subject_lower} {body_snippet[:300].lower()}"
 
     if any(keyword in searchable_text for keyword in CAREER_KEYWORDS):
         return True
@@ -163,26 +207,82 @@ def is_job_candidate(sender: str, subject: str, body_snippet: str) -> bool:
 
 
 # ==============================================================================
-# 6. ANÁLISE SEMÂNTICA COM GEMINI + FALLBACK DE RESILIÊNCIA
+# 6. ANÁLISE SEMÂNTICA COM GROQ + GEMINI + FALLBACK DE RESILIÊNCIA
 # ==============================================================================
-def classify_email_gemini(sender: str, subject: str, body_snippet: str) -> JobAnalysis:
-    """Classifica o e-mail via LLM com fallback automático entre modelos."""
-    client = genai.Client(
-        api_key=GEMINI_API_KEY,
-        http_options=types.HttpOptions(timeout=20_000),
-    )
-    prompt = f"""
+def build_classification_prompt(sender: str, subject: str, body_snippet: str) -> str:
+    """Monta o prompt padronizado exigindo JSON estrito compatível com JobAnalysis."""
+    return f"""
     Classifique se este e-mail é uma atualização real de processo seletivo ou oportunidade de emprego
     (confirmação de candidatura, entrevista, teste técnico, feedback ou contato de recrutador).
-    Ignore cursos pagos, propaganda ou alertas genéricos.
+    Ignore cursos pagos, propaganda, notificações de repositório ou alertas genéricos.
+
+    Responda EXCLUSIVAMENTE com um objeto JSON válido contendo exatamente estas chaves:
+    {{
+      "vaga_relevante": true ou false,
+      "empresa": "nome da empresa",
+      "cargo": "cargo ou vaga",
+      "status": "etapa do processo seletivo",
+      "resumo_acao": "resumo curto em português"
+    }}
 
     De: {sender}
     Assunto: {subject}
     Trecho: {body_snippet}
-    """
-    fallback_models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash-lite"]
+    """.strip()
 
-    for model_name in fallback_models:
+
+def try_classify_groq(prompt: str) -> Optional[JobAnalysis]:
+    """Tenta classificar usando a API OpenAI-compatible da Groq em cascata."""
+    if not GROQ_API_KEY:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    for model_name in GROQ_MODELS:
+        try:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Você é um assistente especialista em recrutamento que responde apenas em JSON válido.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+            }
+            response = requests.post(
+                GROQ_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=20,
+            )
+            response.raise_for_status()
+            data = response.json()
+            raw_content = data["choices"][0]["message"]["content"]
+            return JobAnalysis.model_validate_json(raw_content)
+        except Exception as exc:
+            print(f"   ⚠️ Groq ({model_name}) falhou ({type(exc).__name__}: {exc}). Tentando próximo...")
+            continue
+
+    return None
+
+
+def try_classify_gemini(prompt: str) -> Optional[JobAnalysis]:
+    """Tenta classificar usando a SDK do Google Gemini como provedor secundário."""
+    if not GEMINI_API_KEY:
+        return None
+
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=20_000),
+    )
+
+    for model_name in GEMINI_MODELS:
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -194,10 +294,25 @@ def classify_email_gemini(sender: str, subject: str, body_snippet: str) -> JobAn
             )
             return JobAnalysis.model_validate_json(response.text)
         except Exception as exc:
-            print(f"   ⚠️ {model_name} falhou ({type(exc).__name__}: {exc}). Tentando próximo...")
+            print(f"   ⚠️ Gemini ({model_name}) falhou ({type(exc).__name__}: {exc}). Tentando próximo...")
             continue
 
-    print("   ⚠️ IA indisponível no momento. Enviando alerta preventivo...")
+    return None
+
+
+def classify_email(sender: str, subject: str, body_snippet: str) -> JobAnalysis:
+    """Orquestra a cadeia Groq -> Gemini -> Fallback preventivo seguro."""
+    prompt = build_classification_prompt(sender, subject, body_snippet)
+
+    groq_result = try_classify_groq(prompt)
+    if groq_result is not None:
+        return groq_result
+
+    gemini_result = try_classify_gemini(prompt)
+    if gemini_result is not None:
+        return gemini_result
+
+    print("   ⚠️ Todas as IAs indisponíveis no momento. Enviando alerta preventivo...")
     return JobAnalysis(
         vaga_relevante=True,
         empresa=sender[:40],
@@ -275,7 +390,7 @@ def run_sentinel() -> None:
             time.sleep(REQUEST_DELAY_SECONDS)
 
         print(f"-> Analisando trecho ({len(body_snippet)} chars) com IA: {subject}")
-        analysis = classify_email_gemini(sender, subject, body_snippet)
+        analysis = classify_email(sender, subject, body_snippet)
         ai_calls += 1
 
         if analysis.vaga_relevante:
